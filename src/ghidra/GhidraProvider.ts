@@ -38,6 +38,7 @@ import {
 import { resolveGhidraAnalysisProfile } from "./GhidraAnalysisProfile.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { resolveGhidraAnalysisSeeds } from "./GhidraAnalysisSeeds.js";
+import { resolveGhidraPdbCompanion } from "./GhidraPdbCompanion.js";
 import {
   admitGhidraLanguageOverride,
   GhidraLanguageCatalogCleanupError,
@@ -286,7 +287,16 @@ export class GhidraProvider implements AnalysisProviderCandidate {
       return err(new AnalysisCancelledError("open_binary"));
     const seeds = await resolveGhidraAnalysisSeeds(this.config.ghidraSeedFile);
     if (!seeds.ok) return seeds;
-    if (extensions.value.length === 0 && seeds.value === undefined)
+    const pdb = await resolveGhidraPdbCompanion(
+      this.config.ghidraPdbFile,
+      target,
+    );
+    if (!pdb.ok) return pdb;
+    if (
+      extensions.value.length === 0 &&
+      seeds.value === undefined &&
+      pdb.value === undefined
+    )
       return resolved;
     return ok({
       ...resolved.value,
@@ -298,6 +308,9 @@ export class GhidraProvider implements AnalysisProviderCandidate {
         ...(seeds.value === undefined
           ? {}
           : { analysis_seeds: jsonValueSchema.parse(seeds.value) }),
+        ...(pdb.value === undefined
+          ? {}
+          : { pdb_companion: jsonValueSchema.parse(pdb.value) }),
       }),
     });
   }
