@@ -182,19 +182,7 @@ const compareWebCaptureDimensions = (
   const after = input.after.inspection;
   return {
     dom_structure: domDimension(before, after),
-    scripts: compareDimension(
-      keyed(
-        before.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      keyed(
-        after.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      sectionsComplete(before, ["scripts"]) &&
-        sectionsComplete(after, ["scripts"]),
-      "Script inventory was incomplete in at least one observation.",
-    ),
+    scripts: scriptsDimension(before, after),
     resources: compareDimension(
       keyed(before.resources, (item) => item.resource_key),
       keyed(after.resources, (item) => item.resource_key),
@@ -300,16 +288,45 @@ const networkIdentityCoverage = (
   return { complete, ambiguousIdentities };
 };
 
-const networkResponseFields = [
+const requiredNetworkResponseFields = [
   "status",
   "mime_type",
   "encoded_data_length",
 ] as const;
+const networkResponseFields = [
+  ...requiredNetworkResponseFields,
+  "service_worker",
+  "disk_cache",
+  "service_worker_response_source",
+] as const;
 const redirectMetadataFields = [
+  ...requiredNetworkResponseFields,
+  "resource_type",
+] as const;
+const redirectComparableFields = [
   ...networkResponseFields,
   "resource_type",
 ] as const;
-type NetworkMetadataField = (typeof redirectMetadataFields)[number];
+type NetworkMetadataField =
+  | (typeof networkResponseFields)[number]
+  | (typeof redirectMetadataFields)[number];
+
+const networkResponseValue = (
+  request: Pick<
+    WebPageInspection["network"]["requests"][number],
+    | "status"
+    | "mime_type"
+    | "encoded_data_length"
+    | "resource_type"
+    | "response_source"
+  >,
+  field: NetworkMetadataField,
+): string | number | boolean | null =>
+  field === "service_worker" ||
+  field === "disk_cache" ||
+  field === "service_worker_response_source"
+    ? (request.response_source?.[field] ?? null)
+    : request[field];
 
 /** Own both comparable fields and completeness instead of deriving it from set sizes. */
 const sharedNetworkMetadata = (
@@ -321,31 +338,35 @@ const sharedNetworkMetadata = (
 } => {
   const shared = new Map<string, Set<NetworkMetadataField>>();
   let complete = true;
-  const retainKnownFields = (
+  const retainKnownFields = <Field extends NetworkMetadataField>(
     identity: string,
-    metadata: Pick<
-      WebPageInspection["network"]["requests"][number],
-      NetworkMetadataField
-    >,
-    required: readonly NetworkMetadataField[],
+    value: (field: Field) => string | number | boolean | null,
+    required: readonly Field[],
+    comparable: readonly Field[] = required,
   ): void => {
-    const fields = shared.get(identity) ?? new Set(required);
-    for (const field of required)
-      if (metadata[field] === null) {
+    const fields = shared.get(identity) ?? new Set(comparable);
+    for (const field of comparable)
+      if (value(field) === null) {
         fields.delete(field);
-        complete = false;
+        if (required.includes(field)) complete = false;
       }
     shared.set(identity, fields);
   };
   for (const inspection of [before, after])
     for (const request of inspection.network.requests) {
       const identity = networkIdentity(request);
-      retainKnownFields(identity, request, networkResponseFields);
+      retainKnownFields(
+        identity,
+        (field) => networkResponseValue(request, field),
+        requiredNetworkResponseFields,
+        networkResponseFields,
+      );
       for (const [index, redirect] of (request.redirects ?? []).entries())
         retainKnownFields(
           redirectNetworkIdentity(identity, index),
-          redirect,
+          (field) => networkResponseValue(redirect, field),
           redirectMetadataFields,
+          redirectComparableFields,
         );
     }
   return { fields: shared, complete };
@@ -515,7 +536,7 @@ const networkMap = (
     const values = grouped.get(identity) ?? [];
     const response: Record<string, unknown> = {};
     for (const field of projection.metadataFields.get(identity) ?? [])
-      response[field] = request[field];
+      response[field] = networkResponseValue(request, field);
     values.push(
       digestCanonicalValue({
         ...response,
@@ -528,13 +549,12 @@ const networkMap = (
             },
             index,
           ) => {
-            const response: Partial<
-              Record<NetworkMetadataField, number | string>
-            > = {};
-            for (const field of projection.metadataFields.get(
+            const response: Record<string, unknown> = {};
+            const fields = projection.metadataFields.get(
               redirectNetworkIdentity(identity, index),
-            ) ?? [])
-              if (redirect[field] !== null) response[field] = redirect[field];
+            );
+            for (const field of fields ?? [])
+              response[field] = networkResponseValue(redirect, field);
             return {
               url: redirect.url,
               response_url: redirect.response_url,
@@ -822,6 +842,89 @@ const scriptProjection = (
   language: script.language,
   source_map_url: script.source_map_url,
 });
+
+/** Worker target/script IDs compare one observed instance, never URL peers. */
+const scriptsDimension = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): Dimension => {
+  const selectedWorkers = (inspection: WebPageInspection) =>
+    inspection.workers.filter(
+      (worker) =>
+        worker.observation?.ownership !== "unknown" ||
+        worker.observation.selected_explicitly,
+    );
+  const workerComplete = [before, after].every(
+    (inspection) =>
+      sectionsComplete(inspection, ["workers"]) &&
+      selectedWorkers(inspection).every((worker) => {
+        const coverage = worker.observation?.completeness;
+        return (
+          coverage !== undefined &&
+          !incompleteSections(coverage).has("scripts") &&
+          !incompleteSections(coverage).has("workers") &&
+          coverage.dropped_events.scripts === 0
+        );
+      }),
+  );
+  const pageComplete = [before, after].every(
+    (inspection) =>
+      sectionsComplete(inspection, ["scripts"]) &&
+      inspection.completeness.dropped_events.scripts === 0,
+  );
+  const workerScriptIdentity = (targetId: string, scriptId: string) =>
+    `worker:${compositeKey([targetId, scriptId])}`;
+  const includedSources = (inspection: WebPageInspection) =>
+    new Set(
+      selectedWorkers(inspection).flatMap((worker) =>
+        (worker.observation?.scripts ?? [])
+          .filter((script) => script.source.included)
+          .map((script) =>
+            workerScriptIdentity(worker.target_id, script.script_id),
+          ),
+      ),
+    );
+  const beforeSources = includedSources(before),
+    afterSources = includedSources(after);
+  const fingerprints = (inspection: WebPageInspection) => {
+    const result = new Map(
+      keyed(
+        inspection.scripts.items.map(scriptProjection),
+        (item) => item.script_key,
+      ),
+    );
+    for (const worker of selectedWorkers(inspection))
+      for (const script of worker.observation?.scripts ?? [])
+        result.set(
+          workerScriptIdentity(worker.target_id, script.script_id),
+          digestCanonicalValue({
+            url: script.url,
+            cdp_hash: script.cdp_hash,
+            is_module: script.is_module,
+            language: script.language,
+            source_map_url: script.source_map_url,
+            ...(script.source.included &&
+            beforeSources.has(
+              workerScriptIdentity(worker.target_id, script.script_id),
+            ) &&
+            afterSources.has(
+              workerScriptIdentity(worker.target_id, script.script_id),
+            )
+              ? { source_sha256: script.source.artifact.sha256 }
+              : {}),
+          }),
+        );
+    return result;
+  };
+  return compareDimension(
+    fingerprints(before),
+    fingerprints(after),
+    pageComplete && workerComplete,
+    "Page or worker script inventory was incomplete in at least one observation.",
+    (identity) =>
+      identity.startsWith("worker:") ? workerComplete : pageComplete,
+  );
+};
 
 const metadataProjection = (inspection: WebPageInspection) => ({
   responses: inspection.metadata.responses
