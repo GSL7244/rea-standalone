@@ -3,6 +3,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 import { digestCanonicalValue } from "../../domain/canonicalDigest.js";
 import { AsarArtifactReader } from "../AsarArtifactReader.js";
+import { DotnetBundleArtifactReader } from "../DotnetBundleArtifactReader.js";
 import {
   ArtifactPathRegistry,
   normalizeArtifactPath,
@@ -71,6 +72,15 @@ const extractArtifactInScope = async (
     environment: input.environment,
     integrity: { mode: input.integrityPolicy },
   });
+  if (
+    (input.inputFormat === "pe" || input.inputFormat === "elf") &&
+    snapshot.manifest.root_format !== "dotnet-bundle"
+  )
+    throw new AnalysisUnsupportedTargetError(
+      "extract_artifact",
+      input.inputPath,
+      `Artifact format has no extraction reader: ${input.inputFormat}`,
+    );
   return materializeArtifactInventoryInScope(
     input,
     sourcePath,
@@ -224,7 +234,11 @@ const materializeSelection = async ({
       );
     byPath.set(path, item);
   }
-  const reader = await createReader(sourcePath, input);
+  const reader = await createReader(
+    sourcePath,
+    input,
+    inventory.manifest.root_format,
+  );
   const readerOwner: ArtifactResourceOwner = {
     kind: "reader" as const,
     reader,
@@ -235,6 +249,8 @@ const materializeSelection = async ({
   let completed: ArtifactExtractionResult | undefined;
   const extracted: ExtractedOccurrence[] = [];
   try {
+    if (reader instanceof DotnetBundleArtifactReader)
+      await reader.verifyRootDigest(inventory.manifest.root_sha256, signal);
     try {
       output = await SafeOutputTree.create(input.outputRoot);
     } catch (cause: unknown) {
@@ -422,6 +438,8 @@ const requireExtractableFormat = async (
   if (
     !directory &&
     format !== "asar" &&
+    format !== "pe" &&
+    format !== "elf" &&
     !isMachOFormat(format) &&
     !isZipPackageFormat(format)
   )
@@ -439,7 +457,10 @@ const createReader = async (
     ArtifactExtractionInput,
     "inputPath" | "inputFormat" | "environment"
   >,
+  rootFormat: ArtifactGraphManifest["root_format"],
 ): Promise<ArtifactReader> => {
+  if (rootFormat === "dotnet-bundle")
+    return new DotnetBundleArtifactReader(path);
   const format = input.inputFormat;
   if (await requireExtractableFormat(path, input))
     return new DirectoryArtifactReader(path);
