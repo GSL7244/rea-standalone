@@ -1,6 +1,13 @@
 import * as t from "@babel/types";
+import { createSemanticModuleInterop } from "./javascriptModuleInterop.js";
+import {
+  semanticBuiltinDataProperty,
+  semanticBuiltinSlotChanged,
+} from "./javascriptSemanticDataEffectHelpers.js";
 
 import {
+  semanticCommonJsModuleObjectAt,
+  semanticBuiltinNamespace,
   semanticGlobalProcessOrigin,
   semanticGlobalProcessPathOrigin,
   semanticOriginalGlobalProcessAt,
@@ -18,6 +25,7 @@ import {
   clearSemanticValueCaches,
   evaluateSemanticBinding,
   evaluateSemanticExpression,
+  evaluateSemanticProvenanceAtRead,
 } from "./javascriptSemanticValues.js";
 import { semanticContainer } from "./javascriptSemanticSlots.js";
 import {
@@ -29,7 +37,10 @@ import {
 import { semanticIterationSources } from "./javascriptSemanticIterationSources.js";
 import { semanticCallableResultExpressions } from "./javascriptSemanticCallableResults.js";
 import { createSemanticReturnedReferences } from "./javascriptSemanticReturnedReferences.js";
-import { semanticMutationInitializers } from "./javascriptSemanticMutationInitializers.js";
+import {
+  semanticMutationInitializers,
+  semanticBindingAtRead,
+} from "./javascriptSemanticMutationInitializers.js";
 import {
   semanticReferenceSourcesInactive,
   semanticSelectedReferenceSlot,
@@ -101,7 +112,7 @@ const localSetterReceiver = (
   path: readonly unknown[],
 ): readonly string[] | undefined => {
   const key = path.at(-1);
-  if (typeof key !== "string") return undefined;
+  if (typeof key !== "string" && key !== null) return undefined;
   const receiver = path.slice(0, -1);
   if (!receiver.every((segment) => typeof segment === "string"))
     return undefined;
@@ -123,17 +134,49 @@ const localSetterReceiver = (
     }
     if (!t.isObjectExpression(object)) continue;
     const keys = setterKeys(object);
-    if (keys !== null && (keys.computed || keys.names.has(key)))
+    if (keys !== null && (key === null || keys.computed || keys.names.has(key)))
       return receiver as readonly string[];
   }
   return undefined;
 };
+
+/** An own data descriptor prevents Reflect.set from consulting a prototype setter. */
+const ownLiteralDataProperty = (
+  initializers: readonly {
+    readonly node: t.Node;
+    readonly projection: readonly unknown[];
+  }[],
+  key: string,
+): boolean =>
+  initializers.length > 0 &&
+  initializers.every(({ node, projection }) => {
+    const object = unwrapJavaScriptExpression(node).node;
+    if (projection.length !== 0 || !t.isObjectExpression(object)) return false;
+    for (let index = object.properties.length - 1; index >= 0; index -= 1) {
+      const property = object.properties[index]!;
+      // Object spread creates data properties, so it cannot turn an earlier
+      // own data property into an accessor.
+      if (t.isSpreadElement(property)) continue;
+      const name = semanticStaticPropertyKey(property.key, property.computed);
+      if (name === null) {
+        if (t.isObjectMethod(property) && property.kind !== "method")
+          return false;
+        continue;
+      }
+      if (name !== key) continue;
+      return t.isObjectMethod(property)
+        ? property.kind === "method"
+        : key !== "__proto__" || property.computed || property.shorthand;
+    }
+    return false;
+  });
 
 export function* collectSemanticMemberMutationsSteps(
   program: t.Program,
   state: JavaScriptSemanticAnalysisState,
 ): Generator<void, void> {
   const parents = state.parentsByNode;
+  const interop = createSemanticModuleInterop(state);
   const observablePaths = observableMutationPaths(state);
   const returnedReferences = createSemanticReturnedReferences(state);
   const recordedRequiredEffects = new Set<string>();
@@ -200,6 +243,8 @@ export function* collectSemanticMemberMutationsSteps(
     t.Node,
     JavaScriptSemanticBindingState | null
   >();
+  // Descriptor proof also needs escapes whose payload paths are unobservable.
+  const escapedObjectBindings = new Set<string>();
   const resolveBinding = (
     node: t.Node,
     name: string,
@@ -209,6 +254,57 @@ export function* collectSemanticMemberMutationsSteps(
     const resolved = resolveSemanticBindingState(state, node, name);
     resolvedBindings.set(node, resolved ?? null);
     return resolved;
+  };
+  const nullPrototypeWithoutSetter = (
+    expression: t.Node,
+    key: string,
+    visited = new Set<string>(),
+  ): boolean => {
+    const value = unwrapJavaScriptExpression(expression).node;
+    if (t.isIdentifier(value)) {
+      const binding = resolveBinding(value, value.name);
+      if (
+        binding === undefined ||
+        escapedObjectBindings.has(binding.bindingId) ||
+        binding.escapedPaths.length > 0 ||
+        visited.has(binding.bindingId)
+      )
+        return false;
+      const initializers = semanticBindingAtRead(binding, value, parents)
+        .binding.initializers;
+      const next = new Set(visited).add(binding.bindingId);
+      return (
+        initializers.length > 0 &&
+        initializers.every(
+          (initializer) =>
+            initializer.projection.length === 0 &&
+            nullPrototypeWithoutSetter(initializer.node, key, next),
+        )
+      );
+    }
+    if (t.isObjectExpression(value)) {
+      const setters = setterKeys(value);
+      return (
+        !(setters?.computed || setters?.names.has(key)) &&
+        value.properties.some(
+          (property) =>
+            t.isObjectProperty(property) &&
+            !property.computed &&
+            !property.shorthand &&
+            semanticStaticPropertyKey(property.key, false) === "__proto__" &&
+            t.isNullLiteral(property.value),
+        )
+      );
+    }
+    if (!t.isCallExpression(value) && !t.isOptionalCallExpression(value))
+      return false;
+    const invocation = interop.intrinsicInvocation(value);
+    return (
+      invocation?.kind === "known" &&
+      invocation.path.join(".") === "intrinsic.Object.create" &&
+      invocation.arguments?.length === 1 &&
+      t.isNullLiteral(invocation.arguments[0])
+    );
   };
   // One capture tuple recurs across every alias it reaches. Re-encoding it
   // would rebuild the same long key and force a fresh string hash per lookup.
@@ -465,7 +561,19 @@ export function* collectSemanticMemberMutationsSteps(
           !t.isUnaryExpression(mutation, { operator: "delete" })
         ) {
           const receiver = localSetterReceiver(origins.initializers, path);
-          if (receiver !== undefined) path = [...receiver, null];
+          if (receiver !== undefined) {
+            markValue(
+              current.node,
+              receiver,
+              current.bindings,
+              "escape",
+              mutation,
+              current.originAt,
+              current.ownerInitializer,
+              widenedGetterResult,
+            );
+            path = [...receiver, null];
+          }
         }
         // Keep an antichain of exact paths. Widening distinct member keys would
         // also invalidate unrelated siblings that never reach this effect.
@@ -602,7 +710,25 @@ export function* collectSemanticMemberMutationsSteps(
     node: t.Node,
     mutation: t.Node,
     path: PropertyPath = [],
-  ): void => markValue(node, path, new Set(), "escape", mutation);
+  ): void => {
+    if (path.length === 0) {
+      const pending = [node];
+      const visited = new Set<string>();
+      while (pending.length > 0) {
+        const value = unwrapJavaScriptExpression(pending.pop()!).node;
+        if (!t.isIdentifier(value)) continue;
+        const binding = resolveBinding(value, value.name);
+        if (binding === undefined || visited.has(binding.bindingId)) continue;
+        visited.add(binding.bindingId);
+        escapedObjectBindings.add(binding.bindingId);
+        for (const initializer of semanticBindingAtRead(binding, value, parents)
+          .binding.initializers)
+          if (initializer.projection.length === 0)
+            pending.push(initializer.node);
+      }
+    }
+    markValue(node, path, new Set(), "escape", mutation);
+  };
   function expandedValues(
     expression: t.Node,
     path: PropertyPath,
@@ -755,6 +881,98 @@ export function* collectSemanticMemberMutationsSteps(
         t.isOptionalCallExpression(node) ||
         t.isNewExpression(node)
       ) {
+        const invocation = t.isNewExpression(node)
+          ? undefined
+          : interop.intrinsicInvocation(node);
+        const args = invocation?.arguments;
+        if (
+          invocation?.kind === "known" &&
+          invocation.path.join(".") === "intrinsic.Reflect.set" &&
+          args !== undefined &&
+          args.length >= 3 &&
+          !args.some(t.isSpreadElement)
+        ) {
+          const path = [interop.staticPropertyKey(args[1]) ?? null];
+          const target = unwrapJavaScriptExpression(args[0]!).node;
+          const binding = t.isIdentifier(target)
+            ? resolveBinding(target, target.name)
+            : undefined;
+          const provenance =
+            binding === undefined || !t.isIdentifier(target)
+              ? undefined
+              : evaluateSemanticProvenanceAtRead(binding, target, state);
+          const origin =
+            provenance?.status === "module"
+              ? provenance.origins[0]
+              : semanticRequireOrigin(target, state)?.origin;
+          const builtinUnchanged =
+            origin !== undefined &&
+            path[0] !== null &&
+            semanticBuiltinNamespace(origin) &&
+            !semanticBuiltinSlotChanged(origin, path[0]!, node, state);
+          const dataProperty =
+            builtinUnchanged &&
+            origin !== undefined &&
+            semanticBuiltinDataProperty(origin, path[0]!);
+          const targetInitializers =
+            binding === undefined
+              ? [{ node: target, projection: [] }]
+              : semanticMutationInitializers(binding, node, parents)
+                  .initializers;
+          const invokesSetter =
+            localSetterReceiver(targetInitializers, path) !== undefined;
+          const ownData =
+            path[0] !== null &&
+            (binding === undefined ||
+              (binding.memberWrites.length === 0 &&
+                !escapedObjectBindings.has(binding.bindingId) &&
+                binding.escapedPaths.length === 0)) &&
+            ownLiteralDataProperty(targetInitializers, path[0]!);
+          const nullPrototype =
+            path[0] !== null && nullPrototypeWithoutSetter(target, path[0]!);
+          const wrapperRequireData =
+            path[0] === "require" &&
+            semanticCommonJsModuleObjectAt(target, state) &&
+            !state.ambientWriteEffects.some(
+              ({ path: write, node: effect }) =>
+                effect !== node &&
+                write[0] === "commonjs-module" &&
+                write.length <= 2 &&
+                (write.length === 1 ||
+                  semanticPropertyPathKeyMatches(write[1]!, "require")),
+            ) &&
+            (state.ambientBindingWrites.get("module")?.length ?? 0) === 0;
+          if (invokesSetter || path[0] === null) {
+            // A setter can mutate shared children of its `this` receiver.
+            markEscaped(target, node);
+            if (args[3] !== undefined) markEscaped(args[3], node);
+          } else {
+            if (args[3] === undefined || !dataProperty)
+              markValue(target, path, new Set(), "write", node);
+            if (args[3] !== undefined)
+              markValue(args[3], path, new Set(), "write", node);
+            if (
+              !dataProperty &&
+              (!builtinUnchanged ||
+                state.ambientWrites.covers([
+                  "global",
+                  "Object",
+                  "prototype",
+                  path[0]!,
+                ])) &&
+              !ownData &&
+              !nullPrototype &&
+              !wrapperRequireData
+            ) {
+              // Unknown and inherited descriptors may invoke a setter with
+              // the effective receiver, exposing all of its shared children.
+              markEscaped(args[3] ?? target, node);
+            }
+          }
+          markEscaped(args[1]!, node);
+          markEscaped(args[2]!, node);
+          return;
+        }
         for (const source of returnedReferences(node.callee))
           markEscaped(source.node, node, source.projection);
         for (const argument of node.arguments)
