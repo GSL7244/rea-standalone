@@ -9,9 +9,14 @@ import { wasmArtifactModule } from "../composition/wasm.js";
 import { registerWasmTools } from "./registerWasmTools.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { captureProviderEnvironment } from "./providerEnvironment.js";
-import { createPeResourcesService } from "../composition/binaryDiagnostics.js";
+import {
+  createPeResourcesService,
+  createWindowsMinidumpService,
+} from "../composition/binaryDiagnostics.js";
 import type { PeResourcesService } from "../application/binaryDiagnostics/PeResourcesService.js";
 import { registerPeResourcesTool } from "./registerPeResourcesTool.js";
+import { registerWindowsMinidumpTool } from "./registerWindowsMinidumpTool.js";
+import type { WindowsMinidumpService } from "../application/binaryDiagnostics/WindowsMinidumpService.js";
 import type { EvmInterfaceService } from "../application/evm/EvmInterfaceService.js";
 import { evmInterfaceModule } from "../composition/evm.js";
 import { registerEvmTools } from "./registerEvmTools.js";
@@ -309,6 +314,7 @@ export const createServer = (
     options.webModuleTrace ?? createWebModuleTraceService(environment);
   const goBinary = options.goBinary ?? createGoBinaryService();
   const peResources = createPeResourcesService();
+  const windowsMinidump = createWindowsMinidumpService();
   const webNetworkCapture =
     options.webNetworkCapture ?? createWebNetworkCaptureService(environment);
   const javascriptRecovery =
@@ -386,6 +392,7 @@ export const createServer = (
       webModuleTrace.close(),
       goBinary.close(),
       peResources.close(),
+      windowsMinidump.close(),
       webNetworkCapture.close(),
       javascriptRecovery.close?.() ?? Promise.resolve(),
       options.browserObservation?.close?.() ?? Promise.resolve(),
@@ -439,6 +446,7 @@ export const createServer = (
     artifactResources,
     goBinary,
     peResources,
+    windowsMinidump,
     webNetworkCapture,
   };
   registerBinaryAnalysisTools(toolContext);
@@ -637,6 +645,7 @@ const registerConfiguredAnalysisTools = (
     withAdmittedAnalysis,
     goBinary,
     peResources,
+    windowsMinidump,
     webNetworkCapture,
   }: ServerToolContext,
   android: AndroidAnalysisPort,
@@ -679,6 +688,13 @@ const registerConfiguredAnalysisTools = (
   registerPeResourcesTool(
     server,
     peResources,
+    toolLogger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
+  registerWindowsMinidumpTool(
+    server,
+    windowsMinidump,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,
@@ -804,6 +820,7 @@ const createSessionRecorders = (
 interface ServerToolContext extends ReturnType<typeof createSessionRecorders> {
   readonly goBinary: GoBinaryService;
   readonly peResources: PeResourcesService;
+  readonly windowsMinidump: WindowsMinidumpService;
   readonly webNetworkCapture: WebNetworkCaptureService;
   readonly artifactResources: ArtifactResourceScope;
   readonly server: EvidenceMcpServer;
