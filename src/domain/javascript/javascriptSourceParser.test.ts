@@ -1,7 +1,46 @@
 import { expect, it } from "vitest";
+import * as t from "@babel/types";
 
-import { parseJavaScriptSource } from "./javascriptSourceParser.js";
+import {
+  parseJavaScriptSource,
+  parseRecoveredJavaScript,
+  parserPluginsForPath,
+  hasProvenJavaScriptModuleContext,
+} from "./javascriptSourceParser.js";
 import { analyzeParsedJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+
+it.each([
+  ['import type {T} from "example";', "fixture.cts", false],
+  ['import type {T} from "example";', "fixture.mts", true],
+  ['import type {T} from "example";', "fixture.ts", false],
+  ['export type {T} from "example";', "fixture.ts", false],
+  ['import {type T} from "example";', "fixture.ts", false],
+  ['export {type T} from "example";', "fixture.ts", false],
+  ["export declare const value: unknown;", "fixture.ts", false],
+  ["export default function f(): void;", "fixture.ts", false],
+  ["export default interface I {}", "fixture.ts", false],
+  ["export default function f() {}", "fixture.ts", true],
+  ["export default class C {}", "fixture.ts", true],
+  ['import {} from "example";', "fixture.js", true],
+  ['import {} from "example";', "fixture.cjs", false],
+  ["export {};", "fixture.ts", true],
+  ["const value = 1;", "fixture.mjs", true],
+  ["const value = 1;", "fixture.js", false],
+] as const)(
+  "keeps runtime module proof consistent across parser entries: %s (%s)",
+  (source, path, module) => {
+    const parsed = parseJavaScriptSource(source, path);
+    if (parsed === null) throw new Error("Expected parsed source");
+    const recovered = parseRecoveredJavaScript(source, path, {
+      plugins: parserPluginsForPath(path),
+    }).file;
+    expect(hasProvenJavaScriptModuleContext(parsed.program)).toBe(module);
+    expect(hasProvenJavaScriptModuleContext(recovered.program)).toBe(module);
+    expect(
+      hasProvenJavaScriptModuleContext(t.cloneNode(parsed.program, true)),
+    ).toBe(false);
+  },
+);
 
 const analyze = (source: string, path: string) => {
   const parsed = parseJavaScriptSource(source, path);
