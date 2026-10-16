@@ -22,11 +22,19 @@ import {
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import { snapshotRoots } from "../../../src/process/capture/FilesystemSnapshot.js";
 import { ProcessCaptureError } from "../../../src/process/capture/ProcessCaptureError.js";
-import { expectUnverifiedHostCleanup } from "../../support/hostCleanup.js";
+import {
+  expectUnverifiedHostCleanup,
+  expectSerializedUnverifiedHostCleanup,
+} from "../../support/hostCleanup.js";
+import {
+  verifyNoTokenOwnedProcesses,
+  type ProcessOwnershipHost,
+} from "../../../src/process/ProcessOwnership.js";
 import {
   type ProcessCaptureCleanupHost,
   observeLaunchedExecutable,
   observeSelectedExecutable,
+  ProcessCaptureResourceScope,
 } from "../../../src/process/capture/ProcessCaptureLifecycle.js";
 import { parseProcessScenario } from "../../../src/domain/process/processScenario.js";
 import { emptyProcessCapture } from "../../../src/domain/process/processCapture.fixture.js";
@@ -153,9 +161,9 @@ itWithCaptureCapability(
         settle_ms: 100,
       }),
     );
-    if (!result.ok) throw result.error;
-    expect(result.value.exit).toMatchObject({ code: 0, reason: "exited" });
-    expect(result.value.filesystem_effects).toContainEqual(
+    const { capture } = captureObservations(result);
+    expect(capture.exit).toMatchObject({ code: 0, reason: "exited" });
+    expect(capture.filesystem_effects).toContainEqual(
       expect.objectContaining({
         path: "root_0:.",
         status: "deleted",
@@ -182,7 +190,7 @@ itWithCaptureCapability(
       return wallReads === 1 ? wallStart : wallStart - 60_000 + wallReads;
     });
     const controller = new AbortController();
-    const fallback = setTimeout(() => controller.abort(), 1_500);
+    let fallback: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await captureProcessScenario(
         parseProcessScenario({
@@ -193,10 +201,23 @@ itWithCaptureCapability(
           idle_timeout_ms: 5_000,
         }),
         controller.signal,
+        process.platform,
+        process.env,
+        undefined,
+        undefined,
+        {
+          async report(update) {
+            if (update.phase === "running")
+              fallback ??= setTimeout(() => controller.abort(), 1_500);
+            // Bound the workload deadline, not baseline preparation or final
+            // resource cleanup. A broken deadline never reaches settlement.
+            if (update.phase === "settling" || update.phase === "cleanup")
+              clearTimeout(fallback);
+          },
+        },
       );
-      expect(result.ok).toBe(true);
-      if (!result.ok) throw result.error;
-      expect(result.value.exit.reason).toBe("timeout");
+      const { capture } = captureObservations(result);
+      expect(capture.exit.reason).toBe("timeout");
     } finally {
       clearTimeout(fallback);
       now.mockRestore();
@@ -232,26 +253,25 @@ itWithCaptureCapability(
           },
         },
       );
-      expect(result.ok).toBe(true);
-      if (!result.ok) throw result.error;
-      expect(result.value.frames.length).toBeGreaterThan(0);
-      expect(Date.parse(result.value.manifest.completed_at)).toBeLessThan(
-        Date.parse(result.value.manifest.started_at),
+      const { capture } = captureObservations(result);
+      expect(capture.frames.length).toBeGreaterThan(0);
+      expect(Date.parse(capture.manifest.completed_at)).toBeLessThan(
+        Date.parse(capture.manifest.started_at),
       );
-      expect(result.value.limitations).toContain(
+      expect(capture.limitations).toContain(
         "Wall-clock completion time precedes start time; elapsed capture timing is recorded separately and remains monotonic.",
       );
       expect(
-        result.value.frames.map(({ at_ms }) => at_ms),
+        capture.frames.map(({ at_ms }) => at_ms),
         "capture-relative frame times stay ordered and nonnegative",
       ).toEqual(
-        result.value.frames
+        capture.frames
           .map(({ at_ms }) => at_ms)
           .sort((left, right) => left - right),
       );
-      expect(result.value.frames.every(({ at_ms }) => at_ms >= 0)).toBe(true);
-      expect(result.value.exit.reason).toBe("exited");
-      expect(result.value.settlement.elapsed_ms).toBeGreaterThan(0);
+      expect(capture.frames.every(({ at_ms }) => at_ms >= 0)).toBe(true);
+      expect(capture.exit.reason).toBe("exited");
+      expect(capture.settlement.elapsed_ms).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
     }
@@ -330,6 +350,133 @@ itWithCaptureCapability(
       } finally {
         await rm(root, { recursive: true, force: true });
       }
+    }
+  },
+  10_000,
+);
+
+itWithCaptureCapability(
+  "retains completed capture evidence and its owner when bounded sweep discovery stays incomplete",
+  async () => {
+    let churning = true;
+    let generation = 0;
+    const signalGroup = vi.fn();
+    const inspectionHost: ProcessOwnershipHost = {
+      platform: "darwin",
+      listProcesses: async () =>
+        churning
+          ? [
+              {
+                pid: 1000 + ++generation,
+                parentPid: 1,
+                processGroupId: 1000 + generation,
+                state: "S",
+                command: "fixture-neighbor",
+              },
+            ]
+          : [],
+      processIdentities: async (members) =>
+        new Map(
+          members.map(({ pid }) => [
+            pid,
+            { state: "readable" as const, identity: `start-${String(pid)}` },
+          ]),
+        ),
+      environment: async () => ({ REA_PROCESS_RUN_ID: "other-run" }),
+      signalGroup,
+    };
+    const removeTemporaryRoot = vi.fn(async (path: string) =>
+      rm(path, { recursive: true, force: true }),
+    );
+    const cleanupHost: ProcessCaptureCleanupHost = {
+      platform: process.platform,
+      cleanupProcessGroup: ({ runId }) =>
+        verifyNoTokenOwnedProcesses(runId, inspectionHost),
+      verifyTokenOwnedProcesses: (runId) =>
+        verifyNoTokenOwnedProcesses(runId, inspectionHost),
+      removeTemporaryRoot,
+    };
+    const scope = new ProcessCaptureResourceScope();
+    try {
+      const result = await captureProcessScenario(
+        parseProcessScenario({
+          executable: process.execPath,
+          arguments: ["-e", "process.stdout.write('coverage-frame')"],
+          settle_ms: 0,
+        }),
+        undefined,
+        process.platform,
+        process.env,
+        undefined,
+        cleanupHost,
+        undefined,
+        scope,
+      );
+      if (result.ok) throw new Error("expected incomplete discovery");
+      if (!(result.error instanceof ProcessCaptureError)) throw result.error;
+      expect(result.error.cleanupReport?.owned_process_group.reason).toMatch(
+        /^process ownership discovery could not complete/u,
+      );
+      const partial = result.error.partialObservation;
+      if (partial === undefined || !("capture" in partial))
+        throw new Error("expected completed capture observations");
+      expect(partial.execution_failure).toBeNull();
+      expect(partial.capture.exit).toMatchObject({ code: 0, reason: "exited" });
+      expect(partial.capture.frames.map(({ data }) => data).join("")).toBe(
+        "coverage-frame",
+      );
+      expect(partial.capture.settlement.cleanup_outcome).toBe("failed");
+      expectUnverifiedHostCleanup(result.error, "darwin");
+      const serialized = JSON.parse(
+        JSON.stringify({ error: projectAnalysisError(result.error) }),
+      );
+      expect(
+        expectSerializedUnverifiedHostCleanup(serialized, "darwin"),
+      ).toEqual(partial);
+      for (const reason of [
+        "process identity could not be revalidated; live candidates 900=process identity changed or became unavailable during token validation: process_not_in_snapshot",
+        "process ownership token mismatch for PID(s): 900",
+      ]) {
+        const rejected = new ProcessCaptureError(
+          "unexpected ownership failure",
+          {
+            reason: "cleanup_incomplete",
+            partialObservation: partial,
+            cleanupReport: {
+              owned_process_group: { state: "unverified", reason },
+              terminal_renderer: { state: "cleaned", reason: null },
+              temporary_root: {
+                state: "unverified",
+                reason: `temporary root retained because owned process cleanup is unverified: ${reason}`,
+              },
+            },
+          },
+        );
+        expect(() => expectUnverifiedHostCleanup(rejected, "darwin")).toThrow();
+        expect(() =>
+          expectSerializedUnverifiedHostCleanup(
+            JSON.parse(
+              JSON.stringify({ error: projectAnalysisError(rejected) }),
+            ),
+            "darwin",
+          ),
+        ).toThrow();
+      }
+      expect(removeTemporaryRoot).not.toHaveBeenCalled();
+      await expect(scope.retryCleanup()).rejects.toThrow(
+        "cleanup remains incomplete",
+      );
+      expect(removeTemporaryRoot).not.toHaveBeenCalled();
+      churning = false;
+      await scope.retryCleanup();
+      expect(removeTemporaryRoot).toHaveBeenCalledTimes(1);
+      await expect(
+        access(removeTemporaryRoot.mock.calls[0]![0]),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(signalGroup).not.toHaveBeenCalled();
+    } finally {
+      churning = false;
+      await scope.close();
     }
   },
   10_000,

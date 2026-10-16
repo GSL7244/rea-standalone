@@ -441,6 +441,53 @@ and process residual unknowns. Successful cleanup verifies the owned group;
 it does not attribute those unrelated processes. Related or otherwise unexplained
 unreadable processes still prevent successful cleanup.
 
+A missing run token is reported as `run_token_missing`, rather than proof of a
+foreign run. Cleanup rechecks liveness after token reads: an absent or zombie
+process is settled and excluded from signaling. A live process with a missing
+token, or an unavailable liveness check, still blocks cleanup; an explicitly
+different token remains a mismatch.
+
+The refreshed process table also owns current group membership: newly discovered
+members must pass ownership validation before cleanup can report an empty group.
+Repeated membership churn retains uncertainty after bounded validation attempts.
+Token sweeps apply the same missing-token classification and bounded liveness
+settlement, while unchanged prelaunch start identities remain outside the scan.
+
+Sweep exit and identity checks retain their complete refreshed process tables.
+New candidates, including a reused prelaunch PID in the same process group,
+must be examined before cleanup or final verification can report success.
+Discovery retries share one budget across the cleanup call; exhausted coverage
+remains unresolved. Independently verified groups can still be cleaned while an
+uncertain group and its temporary root stay owned for retry. Unrelated withheld
+environment observations are retained through refreshed scans and partial cleanup.
+
+Generic owned-command cleanup also retains descendant groups found in a fresh
+liveness table. Newly observed rows and changed parent/group relationships are
+also inspected, because a child can already be reparented when its parent exits.
+Cleanup and lineage observation share token/start-identity validation for these
+candidates: positive proof retains owned children, explicit foreign tokens leave
+unrelated children untouched, and unavailable proof keeps the outcome unresolved.
+Stable unrelated rows remain outside generic discovery. Pre-signal discovery precedes the final group ownership check;
+newer scan failures cannot be erased by an earlier successful check. Captured
+start identities remain pinned across bounded replanning, including when a
+process recovers its run token.
+
+Identity-inspection failures preserve the affected PIDs and native inspection
+reasons in the cleanup diagnostic. Completed capture observations remain
+available, and unresolved process cleanup keeps the temporary root owned for
+retry.
+
+An exhausted discovery budget is reported as `process-discovery-incomplete`,
+with the unexamined PIDs and discovery diagnostic. This is incomplete snapshot
+coverage, not a claim that a PID's native start identity changed. It still
+prevents successful cleanup; available observations remain partial and the
+cleanup owner retains its resources for retry.
+
+The process-table producer excludes only its own collector invocation from the
+snapshot that invocation produced. It does not exclude processes by command name
+or infer current ownership from a collector PID after exit. This prevents the
+inspection itself from creating an endless chain of unexamined `ps` candidates.
+
 On macOS, changing a Node process's `process.title` can make its run token
 unreadable. Node documents that [setting the title overwrites argv memory](https://nodejs.org/download/release/v24.18.0/docs/api/process.html#processtitle).
 With the pinned toolchain, a live child retained a readable start identity

@@ -17,6 +17,214 @@ const processes = [100, 101].map((pid) => ({
   command: "fixture",
 }));
 
+it("passes settlement cancellation into the blocked missing-token liveness read", async () => {
+  const controller = new AbortController();
+  const reason = new Error("cancel liveness inspection");
+  let start!: (signal: AbortSignal | undefined) => void;
+  const started = new Promise<AbortSignal | undefined>((resolve) => {
+    start = resolve;
+  });
+  let release: () => void = () => undefined;
+  let reads = 0;
+  const pending = observeOwnedProcessGroups(
+    ownership.runId,
+    [100],
+    {
+      listProcesses: async (signal) => {
+        if (++reads === 1) return processes;
+        start(signal);
+        return new Promise<typeof processes>((resolve, reject) => {
+          release = () => resolve([]);
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+      environment: async () => ({}),
+      signalGroup: vi.fn(),
+    },
+    controller.signal,
+  );
+  const cancelled = expect(pending).rejects.toBe(reason);
+  try {
+    const signal = await started;
+    controller.abort(reason);
+    expect(signal).toBe(controller.signal);
+    await cancelled;
+  } finally {
+    release();
+    await cancelled;
+  }
+});
+
+it.each(["owned", "foreign"])(
+  "validates a new %s descendant before publishing lineage after its parent exits",
+  async (token) => {
+    const child = { ...processes[1]!, pid: 102, parentPid: 101 };
+    let refreshed = false;
+    const environment = vi.fn(async (pid: number) => {
+      if (pid === 101) {
+        refreshed = true;
+        return {};
+      }
+      return {
+        REA_PROCESS_RUN_ID:
+          pid === child.pid && token === "foreign"
+            ? "other-run"
+            : ownership.runId,
+      };
+    });
+    const result = await observeOwnedProcessLineage(ownership, {
+      listProcesses: async () =>
+        refreshed
+          ? [processes[0]!, { ...processes[1]!, state: "Z" }, child]
+          : processes,
+      environment,
+      signalGroup: vi.fn(),
+    });
+    expect(environment).toHaveBeenCalledWith(child.pid);
+    if (token === "owned")
+      expect(result).toMatchObject({
+        status: "verified",
+        lineage: {
+          descendants: [{ pid: 102, parentPid: 101, processGroupId: 100 }],
+        },
+      });
+    else
+      expect(result).toMatchObject({
+        status: "unavailable",
+        reason: "process lineage contains an unowned or PID-reused process",
+      });
+  },
+);
+
+it("does not publish verified group liveness when an exit refresh reveals a foreign member", async () => {
+  const child = { ...processes[1]!, pid: 102 };
+  let refreshed = false;
+  const environment = vi.fn(async (pid: number) => {
+    if (pid === 101) {
+      refreshed = true;
+      return {};
+    }
+    return {
+      REA_PROCESS_RUN_ID: pid === child.pid ? "other-run" : ownership.runId,
+    };
+  });
+  const result = await observeOwnedProcessGroups(ownership.runId, [100], {
+    listProcesses: async () => (refreshed ? [processes[0]!, child] : processes),
+    environment,
+    signalGroup: vi.fn(),
+  });
+  expect(environment).toHaveBeenCalledWith(child.pid);
+  expect(result.get(100)).toEqual({
+    state: "unverifiable",
+    reason: "process ownership did not match",
+  });
+});
+
+it.each(["owned", "foreign", "missing", "reused"])(
+  "accounts for a reparented %s child before publishing refreshed lineage",
+  async (token) => {
+    const child = {
+      ...processes[1]!,
+      pid: 200,
+      parentPid: 1,
+      processGroupId: 200,
+    };
+    const neighbor = { ...child, pid: 900, processGroupId: 900 };
+    let rows = [...processes, neighbor];
+    let childReads = 0;
+    const environment = vi.fn(async (pid: number) => {
+      if (pid === neighbor.pid)
+        throw new Error("Do not inspect stable unrelated rows");
+      if (pid === 101) {
+        rows = [processes[0]!, child, neighbor];
+        return {};
+      }
+      if (pid === child.pid) {
+        childReads++;
+        if (token === "missing") return {};
+        if (token === "foreign") return { REA_PROCESS_RUN_ID: "other-run" };
+      }
+      return { REA_PROCESS_RUN_ID: ownership.runId };
+    });
+    const result = await observeOwnedProcessLineage(ownership, {
+      listProcesses: async () => rows,
+      processIdentities: async (members) =>
+        new Map(
+          members.map(({ pid }) => [
+            pid,
+            {
+              state: "readable" as const,
+              identity:
+                pid === child.pid && token === "reused" && childReads > 0
+                  ? "replacement-start"
+                  : `start-${String(pid)}`,
+            },
+          ]),
+        ),
+      environment,
+      signalGroup: vi.fn(),
+    });
+    expect(environment).toHaveBeenCalledWith(child.pid);
+    expect(environment).not.toHaveBeenCalledWith(neighbor.pid);
+    if (token === "owned" || token === "foreign")
+      expect(result).toMatchObject({
+        status: "verified",
+        lineage: {
+          descendants:
+            token === "owned"
+              ? [{ pid: 200, parentPid: 1, processGroupId: 200 }]
+              : [],
+        },
+      });
+    else
+      expect(result).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringContaining(`PID ${String(child.pid)}`),
+      });
+  },
+);
+
+it.each(["groups", "lineage"])(
+  "bounds repeated descendant replacement during %s observation",
+  async (kind) => {
+    let nextPid = 101;
+    let rows = processes;
+    const environment = vi.fn(async (pid: number) => {
+      if (pid === 100) return { REA_PROCESS_RUN_ID: ownership.runId };
+      rows = [
+        processes[0]!,
+        { ...processes[1]!, pid: ++nextPid, parentPid: pid },
+      ];
+      return {};
+    });
+    const adapter = {
+      listProcesses: async () => rows,
+      environment,
+      signalGroup: vi.fn(),
+    };
+    if (kind === "groups") {
+      const result = await observeOwnedProcessGroups(
+        ownership.runId,
+        [100],
+        adapter,
+      );
+      expect(result.get(100)).toMatchObject({
+        state: "unverifiable",
+        reason: expect.stringContaining("kept changing"),
+      });
+    } else {
+      const result = await observeOwnedProcessLineage(ownership, adapter);
+      expect(result).toMatchObject({
+        status: "unavailable",
+        reason: expect.stringContaining("kept changing"),
+      });
+    }
+    expect(environment.mock.calls.length).toBeLessThan(10);
+  },
+);
+
 describe("multi-group ownership observation", () => {
   it("observes multiple groups from one process snapshot and token batch", async () => {
     const rows = [
@@ -78,7 +286,7 @@ describe("multi-group ownership observation", () => {
     expect(environment).not.toHaveBeenCalled();
   });
 
-  it("rechecks unavailable members individually before classifying their groups", async () => {
+  it("uses one fresh liveness snapshot for the unavailable token batch before classifying groups", async () => {
     const rows = [
       ...processes,
       {
@@ -92,8 +300,7 @@ describe("multi-group ownership observation", () => {
     const listProcesses = vi
       .fn<ProcessOwnershipHost["listProcesses"]>()
       .mockResolvedValueOnce(rows)
-      .mockResolvedValueOnce(rows.filter(({ pid }) => pid !== 101))
-      .mockResolvedValueOnce(rows);
+      .mockResolvedValue(rows.filter(({ pid }) => pid !== 101));
     const runTokens = vi.fn<NonNullable<ProcessOwnershipHost["runTokens"]>>(
       (members) =>
         Promise.resolve(
@@ -131,8 +338,8 @@ describe("multi-group ownership observation", () => {
         ],
       ]),
     );
-    expect(listProcesses).toHaveBeenCalledTimes(3);
-    expect(runTokens).toHaveBeenCalledTimes(1);
+    expect(listProcesses).toHaveBeenCalledTimes(2);
+    expect(runTokens).toHaveBeenCalledTimes(2);
   });
 });
 
